@@ -1,0 +1,5 @@
+<Project>
+	<ItemGroup>
+		<PackageReference Include="Library.Packages.Carbon" Version="2026.4.20.1836" />
+	</ItemGroup>
+</Project>

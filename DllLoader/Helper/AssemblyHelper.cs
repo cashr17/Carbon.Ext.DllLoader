@@ -79,7 +79,7 @@ namespace Oxide.Ext.DllLoader.Helper
             if (IsTypeDefEqual(typeToCheck, typeWanted))
                 return true;
 
-            if (typeToCheck.Interfaces.Select(tp => tp.Resolve()).Any(tp => tp.IsTypeDefEqual(typeWanted) || tp.ImplementInterface(typeWanted)))
+            if (typeToCheck.Interfaces.Select(tp => tp.InterfaceType.Resolve()).Any(tp => tp.IsTypeDefEqual(typeWanted) || tp.ImplementInterface(typeWanted)))
                 return true;
 
             return typeToCheck.GetAllParents().Any(tp => tp.ImplementInterface(typeWanted));

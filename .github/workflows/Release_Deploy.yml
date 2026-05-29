@@ -36,13 +36,13 @@ jobs:
         dotnet-version: 8.0.x
 
     - name: Restore dependencies
-      run: dotnet restore DllLoader --runtime ${{ matrix.runtime }}
+      run: dotnet restore DllLoader --runtime ${{ matrix.runtime }} -p:SkipCarbonExtensionsDeploy=true
 
     - name: Update version
       run: "sed -i \"s#<Version>0.0.0</Version>#<Version>${{ github.event.inputs.version }}</Version>#\" DllLoader/DllLoader.csproj"  
 
     - name: Build Project
-      run: dotnet build DllLoader --configuration ${{ matrix.configuration }} --no-restore --runtime ${{ matrix.runtime }}
+      run: dotnet build DllLoader --configuration ${{ matrix.configuration }} --no-restore --runtime ${{ matrix.runtime }} -p:SkipCarbonExtensionsDeploy=true
 
     - name: Install zip
       run: sudo apt-get install -y zip
@@ -60,6 +60,6 @@ jobs:
           Notes:
             ${{ github.event.inputs.update_notes }}
         files: ${{ env.build_output_dir }}/${{ env.release_artifact_name }}
-        name: Oxide.Ext.DllLoader v${{ github.event.inputs.version }}
+        name: Carbon.Ext.DllLoader v${{ github.event.inputs.version }}
         prerelease: ${{ env.IS_PRE_RELEASE }}
         tag_name: V${{ github.event.inputs.version }}

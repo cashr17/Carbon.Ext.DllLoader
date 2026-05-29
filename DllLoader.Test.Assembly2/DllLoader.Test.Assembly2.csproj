@@ -17,15 +17,7 @@
 	</PropertyGroup>
 
 	<ItemGroup>
-		<Reference Include="Oxide.Core">
-			<HintPath>..\Oxide.Libs\Oxide.Core.dll</HintPath>
-		</Reference>
-		<Reference Include="Oxide.CSharp">
-			<HintPath>..\Oxide.Libs\Oxide.CSharp.dll</HintPath>
-		</Reference>
-		<Reference Include="Oxide.Rust">
-			<HintPath>..\Oxide.Libs\Oxide.Rust.dll</HintPath>
-		</Reference>
+	  <PackageReference Update="Library.Packages.Carbon" Version="2026.5.8.1515" />
 	</ItemGroup>
 
 </Project>

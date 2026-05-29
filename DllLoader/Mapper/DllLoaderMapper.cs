@@ -8,6 +8,7 @@ using System.Reflection;
 using HarmonyLib;
 using Mono.Cecil;
 using Oxide.Core;
+using Oxide.Core.Plugins;
 using Oxide.Ext.DllLoader.API;
 using Oxide.Ext.DllLoader.Model;
 using static HarmonyLib.AccessTools;
@@ -18,10 +19,19 @@ namespace Oxide.Ext.DllLoader.Mapper
 {
     public sealed class DllLoaderMapper : DefaultAssemblyResolver, IDllLoaderMapperLoadable
     {
+        /// <summary>
+        /// File watcher and startup can invoke <see cref="ScanAndRegisterAssemblies"/> concurrently; dictionaries are not safe for concurrent writes.
+        /// </summary>
+        private readonly object _registryLock = new();
+
         private readonly IDictionary<string, AssemblyInfo> _assembliesInfoByName =
             new Dictionary<string, AssemblyInfo>(StringComparer.OrdinalIgnoreCase);
-        private readonly IDictionary<string, IReadOnlyCollection<PluginInfo>> _pluginsInfoByAssemblyName = 
+        private readonly IDictionary<string, IReadOnlyCollection<PluginInfo>> _pluginsInfoByAssemblyName =
             new Dictionary<string, IReadOnlyCollection<PluginInfo>>(StringComparer.OrdinalIgnoreCase);
+
+        private static readonly FieldInfo CecilResolverCacheField =
+            typeof(DefaultAssemblyResolver).GetField("cache", BindingFlags.Instance | BindingFlags.NonPublic)
+            ?? throw new InvalidOperationException("Mono.Cecil DefaultAssemblyResolver has no cache field.");
 
         #region AssemblyResolver
 
@@ -37,23 +47,73 @@ namespace Oxide.Ext.DllLoader.Mapper
         {
             RemoveSearchDirectory(Interface.Oxide.ExtensionDirectory);
             AppDomain.CurrentDomain.AssemblyResolve -= AssemblyResolve;
-            _assembliesInfoByName.Values.Do(a => a.Dispose());
-            _assembliesInfoByName.Clear();
+            lock (_registryLock)
+            {
+                _assembliesInfoByName.Values.Do(a => a.Dispose());
+                _assembliesInfoByName.Clear();
+                _pluginsInfoByAssemblyName.Clear();
+            }
         }
 
         private Assembly? AssemblyResolve(object sender, ResolveEventArgs args)
         {
             var assemblyName = AssemblyNameReference.Parse(args.Name);
             var assemblyInfo = GetAssemblyInfoFromNameReference(assemblyName);
-            if (assemblyInfo == null)
+            if (assemblyInfo != null)
+                return assemblyInfo.Assembly;
+
+            return TryAssemblyLoadFromSearchDirectories(assemblyName.Name);
+        }
+
+        /// <summary>
+        /// Loads a dependency that was not recorded in the Cecil registry yet (ordering, omitted scan, renamed file, etc.).
+        /// Uses <see cref="AddDirectoryToResolver"/> paths (extensions + scanned plugin dirs).
+        /// </summary>
+        private Assembly? TryAssemblyLoadFromSearchDirectories(string? simpleAssemblyName)
+        {
+            if (string.IsNullOrEmpty(simpleAssemblyName))
                 return null;
 
-            return assemblyInfo.Assembly;
+            string[] dirs;
+            lock (_registryLock)
+            {
+                if (_searchResolverDirs.Count == 0)
+                    return null;
+                dirs = _searchResolverDirs.ToArray();
+            }
+
+            foreach (var dir in dirs)
+            {
+                string path;
+                try
+                {
+                    path = Path.Combine(dir, simpleAssemblyName + ".dll");
+                }
+                catch
+                {
+                    continue;
+                }
+
+                if (!File.Exists(path))
+                    continue;
+
+                try
+                {
+                    return LoadAssemblyFromDiskWithoutFileLock(path);
+                }
+                catch
+                {
+                    //
+                }
+            }
+
+            return null;
         }
 
         public override AssemblyDefinition Resolve(AssemblyNameReference name)
         {
-            if (!name.FullName.StartsWith("Oxide.") && !name.Name.StartsWith("Oxide."))
+            if (!name.FullName.StartsWith("Oxide.") && !name.Name.StartsWith("Oxide.") &&
+                !name.FullName.StartsWith("Carbon.") && !name.Name.StartsWith("Carbon."))
             {
                 var assemblyInfo = GetAssemblyInfoFromNameReference(name);
                 if (assemblyInfo != null)
@@ -82,10 +142,13 @@ namespace Oxide.Ext.DllLoader.Mapper
             ScanAndRegisterAssemblies(directory);
 
 #if DEBUG
-            Interface.Oxide.LogDebug("Total assemblies registered({0}).", _assembliesInfoByName.Count);
+            lock (_registryLock)
+                Interface.Oxide.LogDebug("Total assemblies registered({0}).", _assembliesInfoByName.Count);
 #endif
 
-            var plugins = _assembliesInfoByName.Values.SelectMany(ai => ai.PluginsName).ToArray();
+            string[] plugins;
+            lock (_registryLock)
+                plugins = _assembliesInfoByName.Values.SelectMany(ai => ai.PluginsName).ToArray();
 #if DEBUG
             Interface.Oxide.LogDebug("Total plugins registered({0}).", plugins.Length);
 #endif
@@ -103,25 +166,30 @@ namespace Oxide.Ext.DllLoader.Mapper
                 return;
             }
 
-            var dirFiles = new DirectoryInfo(directory).GetFiles("*.dll", SearchOption.TopDirectoryOnly);
-            foreach (var file in dirFiles)
-                RegisterAssemblyFromFile(file);
+            AddDirectoryToResolver(directory);
 
-            foreach (var assemblyInfo in _assembliesInfoByName.Values.Where(a => !_pluginsInfoByAssemblyName.ContainsKey(a.OriginalName)))
+            var dirFiles = new DirectoryInfo(directory).GetFiles("*.dll", SearchOption.AllDirectories);
+
+            lock (_registryLock)
             {
-                try
-                {
-                    _pluginsInfoByAssemblyName.Add(assemblyInfo.OriginalName, assemblyInfo.PluginsInfo);
-                }
-                catch (Exception ex)
-                {
-                    Interface.Oxide.LogException($"Fail to patch assembly({assemblyInfo.OriginalName})", ex);
-                }
+                foreach (var file in dirFiles)
+                    RegisterAssemblyFromFileCore(file);
+
+                foreach (var assemblyInfo in _assembliesInfoByName.Values.Where(a =>
+                             !_pluginsInfoByAssemblyName.ContainsKey(a.OriginalName)))
+                    try
+                    {
+                        _pluginsInfoByAssemblyName[assemblyInfo.OriginalName] = assemblyInfo.PluginsInfo;
+                    }
+                    catch (Exception ex)
+                    {
+                        Interface.Oxide.LogException($"Fail to patch assembly({assemblyInfo.OriginalName})", ex);
+                    }
             }
         }
 
-        private static readonly FieldRef<object, IDictionary<string, AssemblyDefinition>> Cache = FieldRefAccess<IDictionary<string, AssemblyDefinition>>(typeof(DllLoaderMapper), "cache");
-        private void RegisterAssemblyFromFile(FileInfo file)
+        /// <remarks>Caller must hold <see cref="_registryLock"/>.</remarks>
+        private void RegisterAssemblyFromFileCore(FileInfo file)
         {
             if (!file.Exists)
             {
@@ -138,7 +206,18 @@ namespace Oxide.Ext.DllLoader.Mapper
                 return;
             }
 
-            var assemblyDefinition = GetAssemblyDefinitionFromFile(file.FullName);
+            AssemblyDefinition assemblyDefinition;
+            try
+            {
+                assemblyDefinition = GetAssemblyDefinitionFromFile(file.FullName);
+            }
+            catch (Exception ex)
+            {
+                Interface.Oxide.LogWarning("DllLoader: cannot read '{0}' (still copying or invalid PE): {1}", file.FullName,
+                    ex.Message);
+                return;
+            }
+
             var assemblyDefinitionName = assemblyDefinition.Name;
             var assemblyInfo = GetAssemblyInfoFromNameReference(assemblyDefinitionName);
             if (assemblyInfo != null)
@@ -149,10 +228,19 @@ namespace Oxide.Ext.DllLoader.Mapper
                 return;
             }
 
-            assemblyInfo = new AssemblyInfo(assemblyDefinition, file.FullName, this);
+            try
+            {
+                assemblyInfo = new AssemblyInfo(assemblyDefinition, file.FullName, this);
 
-            _assembliesInfoByName.Add(assemblyInfo.OriginalName, assemblyInfo);
-            Cache(this)[assemblyInfo.OriginalName] = assemblyInfo.AssemblyDefinition;
+                _assembliesInfoByName.Add(assemblyInfo.OriginalName, assemblyInfo);
+                var cache =
+                    (IDictionary<string, AssemblyDefinition>)CecilResolverCacheField.GetValue(this)!;
+                cache[assemblyInfo.OriginalName] = assemblyInfo.AssemblyDefinition;
+            }
+            catch (Exception ex)
+            {
+                Interface.Oxide.LogWarning("DllLoader: failed to register '{0}': {1}", file.FullName, ex.Message);
+            }
         }
 
         #endregion
@@ -161,38 +249,130 @@ namespace Oxide.Ext.DllLoader.Mapper
 
         public IReadOnlyCollection<PluginInfo> GetAllPlugins()
         {
-            return _pluginsInfoByAssemblyName.Values.SelectMany(p => p).ToList();
+            lock (_registryLock)
+                return _pluginsInfoByAssemblyName.Values.SelectMany(p => p).ToList();
         }
 
         public AssemblyDefinition GetAssemblyDefinitionFromFile(string filepath)
         {
-            return AssemblyDefinition.ReadAssembly(filepath, new ReaderParameters { AssemblyResolver = this });
+            return AssemblyDefinition.ReadAssembly(filepath, new ReaderParameters
+            {
+                AssemblyResolver = this,
+                InMemory = true,
+                ReadingMode = ReadingMode.Immediate,
+            });
         }
 
         public AssemblyInfo? GetAssemblyInfoFromNameReference(AssemblyNameReference assemblyNameReference)
         {
-            if (_assembliesInfoByName.TryGetValue(assemblyNameReference.Name, out var assemblyInfo))
-                return assemblyInfo;
-            return null;
+            lock (_registryLock)
+                return _assembliesInfoByName.TryGetValue(assemblyNameReference.Name, out var assemblyInfo)
+                    ? assemblyInfo
+                    : null;
         }
 
         public AssemblyInfo? GetAssemblyInfoByPlugin(string pluginName)
         {
-            return _assembliesInfoByName.Values.FirstOrDefault(assemblyInfo => assemblyInfo.ContainsPlugin(pluginName));
+            lock (_registryLock)
+                return _assembliesInfoByName.Values.FirstOrDefault(assemblyInfo =>
+                    assemblyInfo.ContainsPlugin(pluginName));
+        }
+
+        public bool TryGetTrackedDllPluginClassName(string lookupName, out string? pluginClassName)
+        {
+            pluginClassName = null;
+            if (string.IsNullOrWhiteSpace(lookupName))
+                return false;
+
+            var trimmed = lookupName.Trim();
+
+            if (GetAssemblyInfoByPlugin(trimmed) != null)
+            {
+                pluginClassName = trimmed;
+                return true;
+            }
+
+            foreach (var pi in GetAllPlugins())
+            {
+                if (string.Equals(pi.PluginName, trimmed, StringComparison.OrdinalIgnoreCase))
+                {
+                    pluginClassName = pi.PluginName;
+                    return true;
+                }
+
+                var ia = pi.PluginType.GetCustomAttribute<InfoAttribute>(true);
+                var titleRaw = ia?.Title;
+                if (titleRaw == null || string.IsNullOrWhiteSpace(titleRaw))
+                    continue;
+
+                var titleNorm = titleRaw.Trim();
+                if (string.Equals(titleNorm, trimmed, StringComparison.OrdinalIgnoreCase))
+                {
+                    pluginClassName = pi.PluginName;
+                    return true;
+                }
+            }
+
+            return false;
         }
 
         public AssemblyInfo? GetAssemblyInfoByFilename(string fileName)
         {
-            return _assembliesInfoByName.Values.FirstOrDefault(assemblyInfo => assemblyInfo.IsFile(fileName));
+            if (string.IsNullOrWhiteSpace(fileName))
+                return null;
+
+            var probe = fileName.Trim();
+
+            lock (_registryLock)
+            {
+                foreach (var assemblyInfo in _assembliesInfoByName.Values)
+                {
+                    if (string.Equals(assemblyInfo.AssemblyFile, probe, StringComparison.OrdinalIgnoreCase))
+                        return assemblyInfo;
+                }
+
+                return _assembliesInfoByName.Values.FirstOrDefault(assemblyInfo =>
+                    assemblyInfo.IsFile(fileName));
+            }
         }
 
         public void RemoveAssembly(AssemblyInfo assemblyInfo)
         {
-            _assembliesInfoByName.Remove(assemblyInfo.OriginalName);
-            _pluginsInfoByAssemblyName.Remove(assemblyInfo.OriginalName);
+            lock (_registryLock)
+            {
+                _assembliesInfoByName.Remove(assemblyInfo.OriginalName);
+                _pluginsInfoByAssemblyName.Remove(assemblyInfo.OriginalName);
+            }
+
             assemblyInfo.Dispose();
         }
 
         #endregion
+
+        private static Assembly LoadAssemblyFromDiskWithoutFileLock(string path)
+        {
+            using var fs = new FileStream(path, FileMode.Open, FileAccess.Read,
+                FileShare.ReadWrite | FileShare.Delete);
+            using var ms = new MemoryStream();
+            fs.CopyTo(ms);
+            var rawAsm = ms.ToArray();
+
+            var pdbPath = Path.ChangeExtension(path, ".pdb");
+            if (!File.Exists(pdbPath))
+                return Assembly.Load(rawAsm);
+
+            try
+            {
+                using var pdbFs = new FileStream(pdbPath, FileMode.Open, FileAccess.Read,
+                    FileShare.ReadWrite | FileShare.Delete);
+                using var pdbMs = new MemoryStream();
+                pdbFs.CopyTo(pdbMs);
+                return Assembly.Load(rawAsm, pdbMs.ToArray());
+            }
+            catch
+            {
+                return Assembly.Load(rawAsm);
+            }
+        }
     }
 }

@@ -4,7 +4,6 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
-using System.Xml.Linq;
 using HarmonyLib;
 using Oxide.Core;
 using Oxide.Core.Plugins;
@@ -35,10 +34,12 @@ namespace Oxide.Ext.DllLoader.Model
                 if (_plugin != null)
                     return _plugin;
 
-
-                return _plugin ??= (Plugin)Activator.CreateInstance(PluginType);
+                throw new InvalidOperationException(
+                    $"Plugin '{PluginName}' is not instantiated. Carbon.Ext.DllLoader loads only via Carbon ModLoader.InitializePlugin.");
             }
         }
+
+        internal void SetRuntimePlugin(Plugin plugin) => _plugin = plugin;
 
         private List<string> GetReferencesInPlugin()
         {

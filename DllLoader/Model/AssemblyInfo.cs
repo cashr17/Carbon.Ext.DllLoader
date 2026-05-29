@@ -8,7 +8,6 @@ using System.Reflection;
 using HarmonyLib;
 using Mono.Cecil;
 using Oxide.Core;
-using Oxide.Core.CSharp;
 using Oxide.Core.Plugins;
 using Oxide.Ext.DllLoader.Helper;
 
@@ -23,7 +22,7 @@ namespace Oxide.Ext.DllLoader.Model
         public readonly string OriginalName = assemblyDefinition.Name.Name;
 
         private Assembly? _assembly;
-        private AssemblyDefinition? _assemblyDefinition;
+        private AssemblyDefinition? _assemblyDefinition = assemblyDefinition;
         private Dictionary<string, PluginInfo>? _namePluginInfo;
 
         public bool IsAssemblyLoaded => _assembly != null;
@@ -52,7 +51,12 @@ namespace Oxide.Ext.DllLoader.Model
             {
                 if (_assemblyDefinition == null)
                 {
-                    _assemblyDefinition = AssemblyDefinition.ReadAssembly(AssemblyFile, new ReaderParameters { AssemblyResolver = assemblyResolver });
+                    _assemblyDefinition = AssemblyDefinition.ReadAssembly(AssemblyFile, new ReaderParameters
+                    {
+                        AssemblyResolver = assemblyResolver,
+                        InMemory = true,
+                        ReadingMode = ReadingMode.Immediate,
+                    });
                     ApplyPatches();
                 }
 
@@ -79,15 +83,35 @@ namespace Oxide.Ext.DllLoader.Model
 
         public bool IsFile(string fileName)
         {
-            return AssemblyFile.Equals(fileName, StringComparison.OrdinalIgnoreCase) || AssemblyFileNoExt.Equals(fileName, StringComparison.OrdinalIgnoreCase);
+            if (string.IsNullOrWhiteSpace(fileName))
+                return false;
+
+            try
+            {
+                var probe = Path.GetFileName(fileName.Trim());
+                var probeNoExt = Path.GetFileNameWithoutExtension(probe);
+                var ourFile = Path.GetFileName(AssemblyFile);
+
+                if (string.Equals(AssemblyFile, fileName, StringComparison.OrdinalIgnoreCase))
+                    return true;
+                if (string.Equals(ourFile, probe, StringComparison.OrdinalIgnoreCase))
+                    return true;
+                if (string.Equals(AssemblyFileNoExt, probe, StringComparison.OrdinalIgnoreCase))
+                    return true;
+                if (string.Equals(AssemblyFileNoExt, probeNoExt, StringComparison.OrdinalIgnoreCase))
+                    return true;
+
+                return false;
+            }
+            catch
+            {
+                return false;
+            }
         }
 
         private void ApplyPatches()
         {
             _assemblyDefinition!.Name.Name = $"{_assemblyDefinition.Name.Name}-{DateTime.UtcNow.Ticks}";
-            var pluginTypes = _assemblyDefinition.GetPluginTypes();
-            foreach (var pluginType in pluginTypes)
-                _ = new DirectCallMethod(pluginType.Module, pluginType, new ReaderParameters { AssemblyResolver = assemblyResolver });
         }
 
         #region BasicImplementations
@@ -97,6 +121,7 @@ namespace Oxide.Ext.DllLoader.Model
             _namePluginInfo?.Values.Do(p => p.Dispose());
             _namePluginInfo?.Clear();
             _namePluginInfo = null;
+            _assemblyDefinition?.Dispose();
             _assemblyDefinition = null;
             _assembly = null;
         }
