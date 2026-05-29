@@ -120,7 +120,14 @@ namespace Oxide.Ext.DllLoader.Mapper
                     return assemblyInfo.AssemblyDefinition;
             }
 
-            return base.Resolve(name);
+            try
+            {
+                return base.Resolve(name);
+            }
+            catch (AssemblyResolutionException)
+            {
+                return null!;
+            }
         }
 
         private void AddDirectoryToResolver(string directory)
